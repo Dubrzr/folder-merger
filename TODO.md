@@ -26,4 +26,10 @@ Added information :
 
 # TODO-002 
 
-The conflicts handling should not block the comparison/hashing of other files in the meanwhile
+* The conflicts handling should not block the comparison/hashing of other files in the meanwhile
+
+
+# TODO-003
+
+* Fully test the program (100% code/branch coverage)
+
