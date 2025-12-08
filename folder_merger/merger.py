@@ -43,10 +43,43 @@ def format_size(size: int) -> str:
     return f"{size:.1f} TB"
 
 
+class CopyError:
+    """Record of a file that failed to copy."""
+
+    def __init__(self, relative_path: str, src_path: str, dst_path: str, error: str):
+        self.relative_path = relative_path
+        self.src_path = src_path
+        self.dst_path = dst_path
+        self.error = error
+
+
+def _long_path(path: Path) -> str:
+    """Convert path to long path format on Windows to handle paths > 260 chars."""
+    path_str = str(path.resolve())
+    if os.name == 'nt' and not path_str.startswith('\\\\?\\'):
+        return '\\\\?\\' + path_str
+    return path_str
+
+
 def copy_file(src: Path, dst: Path) -> None:
     """Copy a file, creating parent directories if needed."""
-    dst.parent.mkdir(parents=True, exist_ok=True)
-    shutil.copy2(src, dst)
+    # Use long path format on Windows
+    dst_long = _long_path(dst)
+    dst_parent = os.path.dirname(dst_long)
+    os.makedirs(dst_parent, exist_ok=True)
+    shutil.copy2(_long_path(src), dst_long)
+
+
+def safe_copy_file(src: Path, dst: Path, relative_path: str) -> CopyError | None:
+    """
+    Copy a file safely, returning a CopyError if the copy fails.
+    Returns None on success.
+    """
+    try:
+        copy_file(src, dst)
+        return None
+    except (OSError, IOError, PermissionError, shutil.Error) as e:
+        return CopyError(relative_path, str(src), str(dst), str(e))
 
 
 def resolve_conflict(
@@ -170,11 +203,16 @@ def merge_folders(
     print("PHASE 1: Scanning folders")
     print("=" * 60)
 
+    all_scan_errors = []
+
     if not db.is_folder_scanned(1):
         print(f"\nScanning folder 1: {folder1}")
-        files1 = scan_folder(folder1, "Scanning folder 1")
+        files1, errors1 = scan_folder(folder1, "Scanning folder 1")
+        all_scan_errors.extend(("folder1", e) for e in errors1)
         db.save_scanned_files_batch(1, files1)
         db.mark_folder_scanned(1)
+        if errors1:
+            print(f"  Warning: {len(errors1)} files could not be scanned")
     else:
         print("\nFolder 1 already scanned, loading from checkpoint...")
         files1 = db.get_scanned_files(1)
@@ -182,13 +220,26 @@ def merge_folders(
 
     if not db.is_folder_scanned(2):
         print(f"\nScanning folder 2: {folder2}")
-        files2 = scan_folder(folder2, "Scanning folder 2")
+        files2, errors2 = scan_folder(folder2, "Scanning folder 2")
+        all_scan_errors.extend(("folder2", e) for e in errors2)
         db.save_scanned_files_batch(2, files2)
         db.mark_folder_scanned(2)
+        if errors2:
+            print(f"  Warning: {len(errors2)} files could not be scanned")
     else:
         print("\nFolder 2 already scanned, loading from checkpoint...")
         files2 = db.get_scanned_files(2)
         print(f"  Loaded {len(files2)} files")
+
+    # Report scan errors
+    if all_scan_errors:
+        print(f"\n--- Scan Errors ({len(all_scan_errors)} files skipped) ---")
+        for folder_name, error in all_scan_errors[:10]:  # Show first 10
+            print(f"  [{folder_name}] {error.relative_path}")
+            print(f"    {error.error}")
+        if len(all_scan_errors) > 10:
+            print(f"  ... and {len(all_scan_errors) - 10} more errors")
+        print("-" * 20)
 
     # Analyze files
     all_paths = set(files1.keys()) | set(files2.keys())
@@ -229,6 +280,8 @@ def merge_folders(
         print("PHASE 2: Copying non-conflicting files")
         print("=" * 60)
 
+    copy_errors = []
+
     if non_conflicting_to_process:
         already_copied = len(non_conflicting) - len(non_conflicting_to_process)
         print(f"\n{already_copied} files already copied, {len(non_conflicting_to_process)} remaining")
@@ -241,7 +294,9 @@ def merge_folders(
                     continue
                 src = folder1 / path
                 dst = output / path
-                copy_file(src, dst)
+                error = safe_copy_file(src, dst, path)
+                if error:
+                    copy_errors.append(error)
                 db.mark_file_processed(path)
                 pbar.update(1)
 
@@ -251,7 +306,9 @@ def merge_folders(
                     continue
                 src = folder2 / path
                 dst = output / path
-                copy_file(src, dst)
+                error = safe_copy_file(src, dst, path)
+                if error:
+                    copy_errors.append(error)
                 db.mark_file_processed(path)
                 pbar.update(1)
 
@@ -261,11 +318,17 @@ def merge_folders(
                     continue
                 src = folder1 / path
                 dst = output / path
-                copy_file(src, dst)
+                error = safe_copy_file(src, dst, path)
+                if error:
+                    copy_errors.append(error)
                 db.mark_file_processed(path)
                 pbar.update(1)
 
-        print(f"\nAll {len(non_conflicting)} non-conflicting files copied.")
+        if copy_errors:
+            print(f"\n{len(non_conflicting) - len(copy_errors)} files copied successfully.")
+            print(f"Warning: {len(copy_errors)} files could not be copied.")
+        else:
+            print(f"\nAll {len(non_conflicting)} non-conflicting files copied.")
     elif non_conflicting:
         print(f"\nAll {len(non_conflicting)} non-conflicting files already copied.")
 
@@ -296,7 +359,10 @@ def merge_folders(
                 )
                 src = Path(chosen.absolute_path)
                 dst = output / path
-                copy_file(src, dst)
+                error = safe_copy_file(src, dst, path)
+                if error:
+                    copy_errors.append(error)
+                    print(f"  Warning: Could not copy file: {error.error}")
                 db.mark_file_processed(path)
 
             print(f"\nAll {len(conflicts)} conflicts resolved.")
@@ -306,12 +372,29 @@ def merge_folders(
     # =========================================================================
     # Complete
     # =========================================================================
+
+    # Report copy errors
+    if copy_errors:
+        print(f"\n--- Copy Errors ({len(copy_errors)} files failed) ---")
+        for error in copy_errors[:10]:  # Show first 10
+            print(f"  {error.relative_path}")
+            print(f"    {error.error}")
+        if len(copy_errors) > 10:
+            print(f"  ... and {len(copy_errors) - 10} more errors")
+        print("-" * 20)
+
     db.clear()
 
     print("\n" + "=" * 60)
     print("MERGE COMPLETE!")
     print("=" * 60)
     print(f"Output folder: {output}")
-    print(f"Total files merged: {len(all_paths)}")
-    print(f"  - Non-conflicting: {len(non_conflicting)}")
+    total_errors = len(all_scan_errors) + len(copy_errors)
+    successful = len(all_paths) - total_errors
+    print(f"Total files merged: {successful}")
+    print(f"  - Only in folder 1 (recovered): {len(only_in_1)}")
+    print(f"  - Only in folder 2 (recovered): {len(only_in_2)}")
+    print(f"  - Identical (in both): {len(identical)}")
     print(f"  - Conflicts resolved: {len(conflicts)}")
+    if total_errors:
+        print(f"  - Errors (skipped): {total_errors}")
