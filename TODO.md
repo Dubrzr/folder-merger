@@ -23,3 +23,7 @@ Other features of the script :
 Added information :
 
 * The two folders won't change until the script has totally completed its job 
+
+# TODO-002 
+
+The conflicts handling should not block the comparison/hashing of other files in the meanwhile
