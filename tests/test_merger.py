@@ -25,7 +25,7 @@ class TestOpenFileInViewer:
     """Tests for open_file_in_viewer function."""
 
     @patch("folder_merger.merger.platform.system")
-    @patch("folder_merger.merger.os.startfile")
+    @patch("folder_merger.merger.os.startfile", create=True)
     def test_open_file_windows(self, mock_startfile, mock_system):
         mock_system.return_value = "Windows"
         open_file_in_viewer("/path/to/file.txt")
